@@ -63,7 +63,9 @@ SYSTEM_SPEC = (
     "4) Keep file paths relative starting at project root. 5) Do not include binary assets; use placeholders or URLs. "
 )
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+# Prefer a model variant that exists on AI Studio v1beta and supports standard calls
+# Users can override via GEMINI_MODEL env var
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-002")
 
 # In-memory runtime key set via /llm/connect
 _RUNTIME_GEMINI_API_KEY: Optional[str] = None
@@ -108,8 +110,12 @@ def connect_gemini(req: ConnectRequest):
         # Configure with the provided key and validate with a lightweight call
         genai.configure(api_key=key)
         model = genai.GenerativeModel(GEMINI_MODEL)
-        # count_tokens is cheap and verifies auth
-        _ = model.count_tokens("ping")
+        # Prefer count_tokens for inexpensive validation, but gracefully fallback
+        try:
+            _ = model.count_tokens("ping")
+        except Exception:
+            # Some model+API combinations may not expose countTokens. Fallback to a minimal generate.
+            _ = model.generate_content("ping")
         # If successful, store for this process
         _RUNTIME_GEMINI_API_KEY = key
         return ConnectResponse(connected=True, model=GEMINI_MODEL, message="Connected to Gemini.")
@@ -155,7 +161,7 @@ def generate_app(req: GenerateRequest):
         # Strip code fences if present
         cleaned = re.sub(r"^```[a-zA-Z]*|```$", "", text.strip())
         # Find JSON object
-        match = re.search(r"\{[\s\S]*\}\s*$", cleaned)
+        match = re.search(r"\{[\s\S]*\}\s$", cleaned)
         if not match:
             raise HTTPException(status_code=500, detail="Model did not return valid JSON.")
         try:
@@ -206,7 +212,7 @@ def chat_modify(req: ChatRequest):
         payload = json.loads(text)
     except Exception:
         cleaned = re.sub(r"^```[a-zA-Z]*|```$", "", text.strip())
-        match = re.search(r"\{[\s\S]*\}\s*$", cleaned)
+        match = re.search(r"\{[\s\S]*\}\s$", cleaned)
         if not match:
             raise HTTPException(status_code=500, detail="Model did not return valid JSON.")
         payload = json.loads(match.group(0))
