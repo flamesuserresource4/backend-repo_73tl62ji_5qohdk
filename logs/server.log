@@ -1,9 +1,11 @@
 INFO:     Will watch for changes in these directories: ['/home/workspace']
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-INFO:     Started reloader process [149] using StatReload
-INFO:     Started server process [151]
+INFO:     Started reloader process [194] using StatReload
+INFO:     Started server process [196]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
-INFO:     172.20.0.1:38056 - "HEAD / HTTP/1.1" 405 Method Not Allowed
-INFO:     172.20.0.1:50356 - "OPTIONS /llm/generate HTTP/1.1" 200 OK
-INFO:     172.20.0.1:50370 - "POST /llm/generate HTTP/1.1" 500 Internal Server Error
+INFO:     172.20.0.1:60298 - "HEAD / HTTP/1.1" 405 Method Not Allowed
+INFO:     172.20.0.1:60304 - "GET /llm/status HTTP/1.1" 200 OK
+INFO:     172.20.0.1:60304 - "GET /llm/status HTTP/1.1" 200 OK
+INFO:     172.20.0.1:44158 - "GET /llm/status HTTP/1.1" 200 OK
+INFO:     172.20.0.1:44158 - "GET /llm/status HTTP/1.1" 200 OK
