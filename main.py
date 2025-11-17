@@ -63,12 +63,16 @@ SYSTEM_SPEC = (
     "4) Keep file paths relative starting at project root. 5) Do not include binary assets; use placeholders or URLs. "
 )
 
-# Prefer a model variant that exists on AI Studio v1beta and supports standard calls
-# Users can override via GEMINI_MODEL env var
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-002")
+# Default model hint; we will auto-detect a working one for the given key
+_DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
-# In-memory runtime key set via /llm/connect
+# In-memory runtime key/model set via /llm/connect
 _RUNTIME_GEMINI_API_KEY: Optional[str] = None
+_RUNTIME_GEMINI_MODEL: Optional[str] = None
+
+
+def _current_model_name() -> str:
+    return _RUNTIME_GEMINI_MODEL or os.getenv("GEMINI_MODEL") or _DEFAULT_MODEL
 
 
 def _ensure_gemini_config():
@@ -98,27 +102,80 @@ def _extract_text(resp: Any) -> str:
     return str(resp)
 
 
+def _pick_compatible_model() -> str:
+    """Try to find a model that works with the provided key on AI Studio.
+    Strategy:
+    1) Try the configured/env/default model.
+    2) Try through a shortlist of popular models.
+    3) As a final try, list models and pick the first that supports generateContent.
+    """
+    candidates = [
+        _current_model_name(),
+        # Common AI Studio model IDs
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-flash-8b",
+        "gemini-1.5-flash-8b-latest",
+        "gemini-1.5-pro",
+        "gemini-1.5-pro-latest",
+        "gemini-1.0-pro",
+    ]
+
+    tried: List[str] = []
+    for m in candidates:
+        if m in tried:
+            continue
+        tried.append(m)
+        try:
+            model = genai.GenerativeModel(m)
+            _ = model.generate_content("ping")
+            return m
+        except Exception:
+            continue
+
+    # Fallback: list available models and choose one supporting generateContent
+    try:
+        available = getattr(genai, "list_models", lambda: [])()
+        for md in available:
+            name = getattr(md, "name", "")
+            if not name:
+                continue
+            # Python SDK returns names like 'models/gemini-1.5-flash'
+            simple = name.split("/")[-1]
+            methods = set(getattr(md, "supported_generation_methods", []) or [])
+            if "generateContent" in methods:
+                try:
+                    model = genai.GenerativeModel(simple)
+                    _ = model.generate_content("ping")
+                    return simple
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    # If nothing worked, return the current configured name to surface a clear error elsewhere
+    return _current_model_name()
+
+
 @app.post("/llm/connect", response_model=ConnectResponse)
 def connect_gemini(req: ConnectRequest):
-    global _RUNTIME_GEMINI_API_KEY
+    global _RUNTIME_GEMINI_API_KEY, _RUNTIME_GEMINI_MODEL
     if not GEMINI_AVAILABLE:
         raise HTTPException(status_code=500, detail="google-generativeai package not installed on backend.")
     key = (req.api_key or "").strip()
     if not key:
         raise HTTPException(status_code=400, detail="api_key is required")
     try:
-        # Configure with the provided key and validate with a lightweight call
+        # Configure with the provided key and probe for a working model
         genai.configure(api_key=key)
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        # Prefer count_tokens for inexpensive validation, but gracefully fallback
-        try:
-            _ = model.count_tokens("ping")
-        except Exception:
-            # Some model+API combinations may not expose countTokens. Fallback to a minimal generate.
-            _ = model.generate_content("ping")
+        picked = _pick_compatible_model()
+        # Validate with a minimal generate (works across versions)
+        model = genai.GenerativeModel(picked)
+        _ = model.generate_content("ping")
         # If successful, store for this process
         _RUNTIME_GEMINI_API_KEY = key
-        return ConnectResponse(connected=True, model=GEMINI_MODEL, message="Connected to Gemini.")
+        _RUNTIME_GEMINI_MODEL = picked
+        return ConnectResponse(connected=True, model=picked, message="Connected to Gemini.")
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid API key or connection error: {e}")
 
@@ -127,7 +184,7 @@ def connect_gemini(req: ConnectRequest):
 def llm_status():
     return {
         "sdk": "available" if GEMINI_AVAILABLE else "missing",
-        "model": GEMINI_MODEL,
+        "model": _current_model_name(),
         "connected": bool(_RUNTIME_GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")),
     }
 
@@ -135,7 +192,8 @@ def llm_status():
 @app.post("/llm/generate", response_model=GenerateResponse)
 def generate_app(req: GenerateRequest):
     _ensure_gemini_config()
-    model = genai.GenerativeModel(GEMINI_MODEL)
+    model_name = _current_model_name()
+    model = genai.GenerativeModel(model_name)
 
     user_prompt = (
         f"Build a minimal but complete project that satisfies this description: '{req.prompt}'. "
@@ -161,7 +219,7 @@ def generate_app(req: GenerateRequest):
         # Strip code fences if present
         cleaned = re.sub(r"^```[a-zA-Z]*|```$", "", text.strip())
         # Find JSON object
-        match = re.search(r"\{[\s\S]*\}\s$", cleaned)
+        match = re.search(r"\{[\s\S]*\}\s*$", cleaned)
         if not match:
             raise HTTPException(status_code=500, detail="Model did not return valid JSON.")
         try:
@@ -180,13 +238,14 @@ def generate_app(req: GenerateRequest):
     if not files:
         raise HTTPException(status_code=500, detail="No files returned by model.")
 
-    return GenerateResponse(files=files, model=GEMINI_MODEL)
+    return GenerateResponse(files=files, model=model_name)
 
 
 @app.post("/llm/chat", response_model=ChatResponse)
 def chat_modify(req: ChatRequest):
     _ensure_gemini_config()
-    model = genai.GenerativeModel(GEMINI_MODEL)
+    model_name = _current_model_name()
+    model = genai.GenerativeModel(model_name)
 
     file_manifest = "\n".join([f"- {f.path} ({len(f.content)} chars)" for f in req.files])
     files_concat = "\n\n".join([f"FILE: {f.path}\n<content>\n{f.content}\n</content>" for f in req.files])
@@ -212,7 +271,7 @@ def chat_modify(req: ChatRequest):
         payload = json.loads(text)
     except Exception:
         cleaned = re.sub(r"^```[a-zA-Z]*|```$", "", text.strip())
-        match = re.search(r"\{[\s\S]*\}\s$", cleaned)
+        match = re.search(r"\{[\s\S]*\}\s*$", cleaned)
         if not match:
             raise HTTPException(status_code=500, detail="Model did not return valid JSON.")
         payload = json.loads(match.group(0))
@@ -228,7 +287,7 @@ def chat_modify(req: ChatRequest):
     if not files:
         raise HTTPException(status_code=500, detail="No files returned by model.")
 
-    return ChatResponse(files=files, model=GEMINI_MODEL)
+    return ChatResponse(files=files, model=model_name)
 
 
 @app.get("/test")
@@ -237,6 +296,7 @@ def test_database():
         "backend": "✅ Running",
         "gemini_sdk": "✅ Available" if GEMINI_AVAILABLE else "❌ Not Installed",
         "gemini_key": "✅ Set" if (_RUNTIME_GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")) else "❌ Not Set",
+        "model": _current_model_name(),
     }
     return response
 
